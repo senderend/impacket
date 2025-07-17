@@ -108,15 +108,16 @@ class HTTPSocksRelay(SocksRelay):
 
             # Check if we have a connection for the user
             if self.username in self.activeRelays:
-                # Check the connection is not inUse
-                if self.activeRelays[self.username]['inUse'] is True:
-                    LOG.error('HTTP: Connection for %s@%s(%s) is being used at the moment!' % (
-                        self.username, self.targetHost, self.targetPort))
-                    return False
-                else:
-                    LOG.info('HTTP: Proxying client session for %s@%s(%s)' % (
-                        self.username, self.targetHost, self.targetPort))
-                    self.session = self.activeRelays[self.username]['protocolClient'].session
+                # HTTP is stateless - disable inUse check to allow concurrent browser sessions
+                # IIS handles session persistence server-side via cookies
+                # if self.activeRelays[self.username]['inUse'] is True:
+                #     LOG.error('HTTP: Connection for %s@%s(%s) is being used at the moment!' % (
+                #         self.username, self.targetHost, self.targetPort))
+                #     return False
+                # else:
+                LOG.info('HTTP: Proxying client session for %s@%s(%s)' % (
+                    self.username, self.targetHost, self.targetPort))
+                self.session = self.activeRelays[self.username]['protocolClient'].session
             else:
                 LOG.error('HTTP: No session for %s@%s(%s) available' % (
                     self.username, self.targetHost, self.targetPort))
