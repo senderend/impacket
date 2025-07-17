@@ -126,9 +126,42 @@ class HTTPRelayClient(ProtocolClient):
             self.session = None
 
     def keepAlive(self):
-        # Do a HEAD for favicon.ico
-        self.session.request('HEAD','/favicon.ico')
-        self.session.getresponse()
+        # Do a HEAD for favicon.ico with proper connection state management
+        try:
+            # Check if connection is in a proper state for sending requests
+            if hasattr(self.session, '_HTTPConnection__state'):
+                state = self.session._HTTPConnection__state
+                # Only send request if connection is idle
+                if state != 'Request-sent':
+                    self.session.request('HEAD','/favicon.ico')
+                    try:
+                        response = self.session.getresponse()
+                        response.read()  # Consume the response to reset connection state
+                    except Exception as e:
+                        LOG.debug('HTTP keepAlive: Error reading response: %s' % str(e))
+                        # Reset connection on error
+                        try:
+                            self.session.close()
+                            if isinstance(self, HTTPSRelayClient):
+                                try:
+                                    uv_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                                    self.session = HTTPSConnection(self.targetHost, self.targetPort, context=uv_context)
+                                except AttributeError:
+                                    self.session = HTTPSConnection(self.targetHost, self.targetPort)
+                            else:
+                                self.session = HTTPConnection(self.targetHost, self.targetPort)
+                        except Exception as reset_error:
+                            LOG.debug('HTTP keepAlive: Error resetting connection: %s' % str(reset_error))
+                else:
+                    LOG.debug('HTTP keepAlive: Skipping - connection in Request-sent state')
+            else:
+                # Fallback for connections without state attribute
+                self.session.request('HEAD','/favicon.ico')
+                response = self.session.getresponse()
+                response.read()
+        except Exception as e:
+            LOG.debug('HTTP keepAlive: Exception occurred: %s' % str(e))
+            # Don't raise the exception - keepAlive failures shouldn't be fatal
 
 class HTTPSRelayClient(HTTPRelayClient):
     PLUGIN_NAME = "HTTPS"
