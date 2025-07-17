@@ -88,7 +88,47 @@ class HTTPSocksRelay(SocksRelay):
                 pass
             return False
             
-        # Get headers from data  
+        if '?session=' in request_line:
+            # Extract the original path and session parameter
+            path_with_params = request_line.split(' ')[1]  # GET /path?session=user HTTP/1.1
+            original_path = path_with_params.split('?')[0]  # /path
+            session_param = request_line.split('?session=')[1].split(' ')[0]
+            
+            # URL decode
+            import urllib.parse
+            selected_session = urllib.parse.unquote(session_param).upper()
+            
+            # Check if this session exists
+            if selected_session in self.activeRelays:
+                self.username = selected_session
+                LOG.info('HTTP: Session selected via form: %s@%s(%s)' % (
+                    self.username, self.targetHost, self.targetPort))
+                self.session = self.activeRelays[self.username]['protocolClient'].session
+                
+                # Point our socket to the sock attribute of HTTPConnection
+                self.relaySocket = self.session.sock
+                
+                # Check if connection is still alive
+                if not self.isConnectionAlive():
+                    LOG.error('HTTP: Relay connection is dead for session %s' % selected_session)
+                    return False
+                    
+                # Create a clean request to the original path without the parameter
+                clean_request = ('GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\n\r\n' % (original_path, self.targetHost)).encode()
+                # Send the request to the server
+                try:
+                    self.relaySocket.send(clean_request)
+                    # Send the response back to the client
+                    self.transferResponse()
+                    return True
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    LOG.error('HTTP: Failed to send request for session %s: %s' % (selected_session, str(e)))
+                    return False
+            else:
+                # Invalid session, show picker again  
+                LOG.error('HTTP: Invalid session selected: %s' % selected_session)
+        
+        # Get headers from data
         headerDict = self.getHeaders(data)
         try:
             creds = headerDict['authorization']
@@ -124,11 +164,33 @@ class HTTPSocksRelay(SocksRelay):
                 return False
 
         except KeyError:
-            # User didn't provide authentication yet, prompt for it
-            LOG.debug('No authentication provided, prompting for basic authentication')
-            reply = [b'HTTP/1.1 401 Unauthorized',b'WWW-Authenticate: Basic realm="ntlmrelayx - provide a DOMAIN/username"',b'Connection: close',b'',b'']
-            self.socksSocket.send(EOL.join(reply))
-            return False
+            # User didn't provide authentication, check available sessions
+            LOG.debug('No authentication provided, checking available sessions')
+            
+            # Find available sessions for this target
+            available_users = []
+            for user in self.activeRelays.keys():
+                # HTTP allows concurrent sessions - ignore inUse flag (likely inherited from other stateful protocols)
+                if user not in ['data', 'scheme']: # and not self.activeRelays[user]['inUse']:
+                    available_users.append(user)
+            
+            if len(available_users) == 0:
+                # No available sessions, return error
+                LOG.error('HTTP: No available sessions for %s(%s)' % (self.targetHost, self.targetPort))
+                reply = [b'HTTP/1.1 503 Service Unavailable',b'Connection: close',b'',b'No relayed sessions available for this target']
+                self.socksSocket.send(EOL.join(reply))
+                return False
+            elif len(available_users) == 1:
+                # Only one session, auto-select it
+                self.username = available_users[0]
+                LOG.info('HTTP: Auto-selecting single session for %s@%s(%s)' % (
+                    self.username, self.targetHost, self.targetPort))
+                self.session = self.activeRelays[self.username]['protocolClient'].session
+            else:
+                # Multiple sessions, show selection page
+                LOG.info('HTTP: Multiple sessions available, showing selection page')
+                self.showSessionSelection(available_users)
+                return False
 
         # When we are here, we have a session
         # Point our socket to the sock attribute of HTTPConnection
@@ -150,6 +212,56 @@ class HTTPSocksRelay(SocksRelay):
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.error('HTTP: Failed to send initial request for session %s: %s' % (self.username, str(e)))
             return False
+    def showSessionSelection(self, available_users):
+        """Show HTML page with available session choices that generate Basic Auth headers"""
+        
+        # Build HTML page with session options
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>ntlmrelayx - Select Session</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2 { color: #333; margin-bottom: 20px; }
+        .session { padding: 15px; margin: 10px 0; border: 2px solid #ddd; border-radius: 5px; cursor: pointer; transition: all 0.3s; }
+        .session:hover { background-color: #f0f8ff; border-color: #4CAF50; }
+        .username { font-weight: bold; font-size: 16px; color: #2c3e50; }
+        .admin { font-size: 14px; color: #666; margin-top: 5px; }
+        .admin.true { color: #e74c3c; font-weight: bold; }
+        .info { color: #666; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Select Relayed Session</h2>
+        <div class="info">Multiple sessions available for <strong>%s:%s</strong><br>
+        Click a session to proceed with those credentials:</div>
+""" % (self.targetHost, self.targetPort)
+        
+        # Add each available session as a form
+        for user in available_users:
+            admin_status = self.activeRelays[user].get('isAdmin', 'N/A')
+            admin_class = 'true' if admin_status == True else 'false'
+            html += '''
+        <form method="GET" action="" style="margin: 0;">
+            <input type="hidden" name="session" value="%s">
+            <div class="session" onclick="this.parentNode.submit()" style="cursor: pointer;">
+                <div class="username">%s</div>
+                <div class="admin %s">Admin privileges: %s</div>
+            </div>
+        </form>''' % (user, user, admin_class, admin_status)
+        
+        html += """
+    </div>
+</body>
+</html>"""
+        
+        # Send HTTP response with session selection page
+        response_body = html.encode('utf-8')
+        response = b'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(response_body)
+        
+        self.socksSocket.send(response + response_body)
 
     def getHeaders(self, data):
         # Get the headers from the request, ignore first "header"
@@ -223,9 +335,7 @@ class HTTPSocksRelay(SocksRelay):
             if headerSize == -1:
                 LOG.debug('HTTP: Invalid chunked response - no headers')
                 return
-
             self.socksSocket.send(data[:headerSize + 4])
-
             body = data[headerSize + 4:]
             if not body:
                 LOG.debug('HTTP: No body data for chunked response')
