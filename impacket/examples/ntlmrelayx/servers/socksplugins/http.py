@@ -33,6 +33,8 @@ class HTTPSocksRelay(SocksRelay):
     def __init__(self, targetHost, targetPort, socksSocket, activeRelays):
         SocksRelay.__init__(self, targetHost, targetPort, socksSocket, activeRelays)
         self.packetSize = 8192
+        self.relaySocket = None
+        self.session = None
 
     @staticmethod
     def getProtocolPort():
@@ -40,6 +42,22 @@ class HTTPSocksRelay(SocksRelay):
 
     def initConnection(self):
         pass
+        
+    def isConnectionAlive(self):
+        """Check if the relay connection is still alive"""
+        if not self.relaySocket or not self.session:
+            return False
+        try:
+            # Try to peek at the socket without consuming data
+            import socket
+            self.relaySocket.settimeout(0.1)
+            self.relaySocket.recv(1, socket.MSG_PEEK)
+            self.relaySocket.settimeout(None)
+            return True
+        except (socket.timeout, socket.error, OSError):
+            return True  # Assume alive if we can't determine
+        except Exception:
+            return False
 
     def skipAuthentication(self):
         # See if the user provided authentication
