@@ -69,7 +69,26 @@ class HTTPSocksRelay(SocksRelay):
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.debug('HTTP: Client connection error: %s' % str(e))
             return False
-        # Get headers from data
+        
+        # Check if this is a session selection request
+        try:
+            request_line = data.split(EOL)[0].decode("ascii")
+        except (UnicodeDecodeError, IndexError):
+            LOG.debug('HTTP: Invalid request format')
+            return False
+            
+        # Check for WebSocket upgrade requests and reject them
+        headers = self.getHeaders(data)
+        if headers.get('upgrade', '').lower() == 'websocket':
+            LOG.debug('HTTP: WebSocket upgrade request detected - rejecting')
+            response = b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nWebSocket not supported'
+            try:
+                self.socksSocket.send(response)
+            except:
+                pass
+            return False
+            
+        # Get headers from data  
         headerDict = self.getHeaders(data)
         try:
             creds = headerDict['authorization']
@@ -326,6 +345,21 @@ class HTTPSocksRelay(SocksRelay):
                 if not data:
                     LOG.debug('HTTP: Client closed connection')
                     return
+                    
+                # Check for WebSocket upgrade requests in tunnel mode
+                try:
+                    headers = self.getHeaders(data)
+                    if headers.get('upgrade', '').lower() == 'websocket':
+                        LOG.debug('HTTP: WebSocket upgrade in tunnel - rejecting')
+                        response = b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nWebSocket not supported'
+                        try:
+                            self.socksSocket.send(response)
+                        except:
+                            pass
+                        return
+                except:
+                    # Continue with normal processing if header parsing fails
+                    pass
                     
                 # Pass the request to the server
                 tosend = self.prepareRequest(data)
