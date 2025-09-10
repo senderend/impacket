@@ -48,12 +48,17 @@ class HTTPSocksRelay(SocksRelay):
         if not self.relaySocket or not self.session:
             return False
         try:
-            # Try to peek at the socket without consuming data
-            import socket
-            self.relaySocket.settimeout(0.1)
-            self.relaySocket.recv(1, socket.MSG_PEEK)
-            self.relaySocket.settimeout(None)
-            return True
+            # For HTTPS connections, use simple socket check
+            from http.client import HTTPSConnection
+            if isinstance(self.session, HTTPSConnection):
+                return hasattr(self.session, 'sock') and self.session.sock is not None
+            else:
+                # Original logic for HTTP - try to peek at the socket without consuming data
+                import socket
+                self.relaySocket.settimeout(0.1)
+                self.relaySocket.recv(1, socket.MSG_PEEK)
+                self.relaySocket.settimeout(None)
+                return True
         except (socket.timeout, socket.error, OSError):
             return True  # Assume alive if we can't determine
         except Exception:
