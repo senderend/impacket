@@ -64,7 +64,7 @@ setup(
     long_description_content_type="text/markdown",
     platforms=["Unix", "Windows"],
     packages=['impacket', 'impacket.dcerpc', 'impacket.examples', 'impacket.dcerpc.v5', 'impacket.dcerpc.v5.dcom',
-              'impacket.krb5', 'impacket.ldap', 'impacket.examples.ntlmrelayx',
+              'impacket.krb5', 'impacket.ldap', 'impacket.examples.ntlmrelayx', 'impacket.mssql',
               'impacket.examples.ntlmrelayx.clients', 'impacket.examples.ntlmrelayx.servers',
               'impacket.examples.ntlmrelayx.servers.socksplugins', 'impacket.examples.ntlmrelayx.utils',
               'impacket.examples.ntlmrelayx.attacks', 'impacket.examples.ntlmrelayx.attacks.httpattacks'],
@@ -76,11 +76,11 @@ setup(
     extras_require={':sys_platform=="win32"': ['pyreadline3'],
                     },
     classifiers=[
+        "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9"
 
     ]
 )
