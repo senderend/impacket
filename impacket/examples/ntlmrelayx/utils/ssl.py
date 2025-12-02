@@ -42,6 +42,7 @@ def generateImpacketCert(certname='/tmp/impacket.crt'):
     cert.gmtime_adj_notAfter(60*60*24*365*5)
     subj = cert.get_subject()
     subj.CN = 'impacket'
+    cert.set_issuer(cert.get_subject())
     cert.set_pubkey(pkey)
     cert.sign(pkey, "sha256")
     # We write both from the same file
