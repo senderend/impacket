@@ -76,3 +76,6 @@ tests/dcetests.cfg
 
 # slop
 .claude/
+GEMINI.md
+testingOutput.txt
+headers.har
