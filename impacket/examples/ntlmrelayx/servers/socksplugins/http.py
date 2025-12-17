@@ -408,14 +408,14 @@ class HTTPSocksRelay(SocksRelay):
         response = []
         for part in data.split(EOL):
             # This means end of headers, stop parsing here
-            if part == '':
+            if part == b'':
                 break
             # Remove the Basic authentication header
             if b'authorization' in part.lower():
                 continue
             # Don't close the connection
             if b'connection: close' in part.lower():
-                response.append('Connection: Keep-Alive')
+                response.append(b'Connection: Keep-Alive')
                 continue
             # If we are here it means we want to keep the header
             response.append(part)
