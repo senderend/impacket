@@ -30,7 +30,7 @@ import time
 import logging
 from queue import Queue
 from struct import unpack, pack
-from threading import Timer, Thread
+from threading import Timer, Thread, Lock
 
 from impacket import LOG
 from impacket.dcerpc.v5.enum import Enum
@@ -189,7 +189,23 @@ def keepAliveTimer(server):
             for user in list(server.activeRelays[target][port].keys()):
                 if user != 'data' and user != 'scheme':
                     # Let's call the keepAlive method for the handler to keep the connection alive
-                    if server.activeRelays[target][port][user]['inUse'] is False:
+                    # Try to acquire socket lock with timeout - if we can't, skip (connection is in use)
+                    socketLock = server.activeRelays[target][port][user].get('socketLock')
+                    if socketLock:
+                        # Try to acquire with 0.1 second timeout
+                        if socketLock.acquire(blocking=True, timeout=0.1):
+                            try:
+                                LOG.debug('Calling keepAlive() for %s@%s:%s' % (user, target, port))
+                                server.activeRelays[target][port][user]['protocolClient'].keepAlive()
+                            except Exception as e:
+                                LOG.debug("Exception:",exc_info=True)
+                                LOG.debug('SOCKS: %s' % str(e))
+                            finally:
+                                socketLock.release()
+                        else:
+                            LOG.debug('HTTP keepAlive: Skipping %s@%s:%s - socket in use' % (user, target, port))
+                    elif server.activeRelays[target][port][user]['inUse'] is False:
+                        # Fallback for protocols without socketLock
                         LOG.debug('Calling keepAlive() for %s@%s:%s' % (user, target, port))
                         try:
                             server.activeRelays[target][port][user]['protocolClient'].keepAlive()
@@ -223,6 +239,7 @@ def activeConnectionsWatcher(server):
             # Inside this instance, you have the session attribute pointing to the relayed session.
             server.activeRelays[target][port][userName]['protocolClient'] = client
             server.activeRelays[target][port][userName]['inUse'] = False
+            server.activeRelays[target][port][userName]['socketLock'] = Lock()
             server.activeRelays[target][port][userName]['data'] = data
             # Just for the CHALLENGE data, we're storing this general
             server.activeRelays[target][port]['data'] = data

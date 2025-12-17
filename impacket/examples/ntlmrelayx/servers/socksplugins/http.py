@@ -26,6 +26,14 @@ from impacket.examples.ntlmrelayx.servers.socksserver import SocksRelay
 PLUGIN_CLASS = "HTTPSocksRelay"
 EOL = b'\r\n'
 
+# === DEBUG FLAG: Set to True to enable verbose auth debugging ===
+# REMOVE THIS BLOCK AFTER DEBUGGING
+HTTP_AUTH_DEBUG = True
+def _dbg(msg):
+    if HTTP_AUTH_DEBUG:
+        LOG.info('[HTTP-DBG] %s' % msg)
+# === END DEBUG FLAG ===
+
 class HTTPSocksRelay(SocksRelay):
     PLUGIN_NAME = 'HTTP Socks Plugin'
     PLUGIN_SCHEME = 'HTTP'
@@ -112,6 +120,7 @@ class HTTPSocksRelay(SocksRelay):
                 
                 # Point our socket to the sock attribute of HTTPConnection
                 self.relaySocket = self.session.sock
+                LOG.info('HTTP: Request for %s using relaySocket ID: %s' % (original_path, id(self.relaySocket)))
                 
                 # Check if connection is still alive
                 if not self.isConnectionAlive():
@@ -191,6 +200,9 @@ class HTTPSocksRelay(SocksRelay):
                 LOG.info('HTTP: Auto-selecting single session for %s@%s(%s)' % (
                     self.username, self.targetHost, self.targetPort))
                 self.session = self.activeRelays[self.username]['protocolClient'].session
+
+                # Point our socket to the sock attribute of HTTPConnection
+                self.relaySocket = self.session.sock
             else:
                 # Multiple sessions, show selection page
                 LOG.info('HTTP: Multiple sessions available, showing selection page')
@@ -201,18 +213,29 @@ class HTTPSocksRelay(SocksRelay):
         # Point our socket to the sock attribute of HTTPConnection
         # (contained in the session), which contains the socket
         self.relaySocket = self.session.sock
-        
+
+        # Get the socket lock to prevent concurrent access from multiple threads
+        try:
+            socketLock = self.activeRelays[self.username]['socketLock']
+        except KeyError:
+            LOG.error('HTTP: Socket lock not found for %s' % self.username)
+            return False
+
         # Check if connection is still alive
         if not self.isConnectionAlive():
             LOG.error('HTTP: Relay connection is dead for session %s' % self.username)
             return False
-            
+
         # Send the initial request to the server
         try:
-            tosend = self.prepareRequest(data)
-            self.relaySocket.send(tosend)
-            # Send the response back to the client
-            self.transferResponse()
+            # Use lock to prevent concurrent socket access from multiple threads
+            # Only one thread can send/receive at a time to prevent socket state corruption
+            import threading
+            with socketLock:
+                tosend = self.prepareRequest(data)
+                self.relaySocket.send(tosend)
+                # Send the response back to the client
+                self.transferResponse()
             return True
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.error('HTTP: Failed to send initial request for session %s: %s' % (self.username, str(e)))
@@ -292,43 +315,72 @@ class HTTPSocksRelay(SocksRelay):
             if not data:
                 LOG.debug('HTTP: No data received from relay socket - connection may be closed')
                 return
-                
+
+            # === DEBUG: Log response details ===
+            try:
+                status_line = data.split(b'\r\n')[0].decode('utf-8', errors='replace')
+                _dbg('<<< RESPONSE: %s' % status_line)
+
+                # Log key headers for ALL responses
+                headers = self.getHeaders(data)
+                if 'www-authenticate' in headers:
+                    _dbg('<<< WWW-Authenticate: %s' % headers['www-authenticate'])
+                if 'set-cookie' in headers:
+                    _dbg('<<< Set-Cookie: %s' % headers['set-cookie'])
+
+                # Check for 401 Unauthorized or 400 Bad Request
+                if ' 401 ' in status_line or ' 400 ' in status_line:
+                    headerSize = data.find(EOL+EOL)
+                    if headerSize != -1:
+                        try:
+                            resp_headers = data[:headerSize].decode('utf-8', errors='replace')
+                            LOG.info('HTTP: Error Response Headers (%s):\n%s' % (status_line.strip(), resp_headers))
+                        except:
+                            pass
+            except:
+                pass
+            # === END DEBUG ===
+
             headerSize = data.find(EOL+EOL)
             if headerSize == -1:
                 LOG.debug('HTTP: No complete headers found in response')
                 self.socksSocket.send(data)
                 return
-                
+
             headers = self.getHeaders(data)
+            content_length = headers.get('content-length', 'none')
+            transfer_encoding = headers.get('transfer-encoding', 'none')
+
             try:
                 bodySize = int(headers.get('content-length', 0))
                 if bodySize > 0:
                     readSize = len(data)
+                    expectedTotal = bodySize + headerSize + 4
+
                     # Make sure we send the entire response, but don't keep it in memory
                     self.socksSocket.send(data)
-                    while readSize < bodySize + headerSize + 4:
+                    while readSize < expectedTotal:
                         try:
                             data = self.relaySocket.recv(self.packetSize)
                             if not data:
-                                LOG.debug('HTTP: Connection closed while reading body')
+                                LOG.debug('HTTP: Connection closed while reading body (read %d of %d)' % (readSize, expectedTotal))
                                 break
                             readSize += len(data)
                             self.socksSocket.send(data)
                         except (ConnectionResetError, BrokenPipeError, OSError) as e:
                             LOG.debug('HTTP: Connection error while reading response body: %s' % str(e))
                             break
+                    LOG.debug('HTTP: Finished reading response - read %d of %d expected bytes' % (readSize, expectedTotal))
                 else:
                     # No content-length, check for chunked encoding
                     if headers.get('transfer-encoding', '').lower() == 'chunked':
                         # Chunked transfer-encoding
-                        LOG.debug('Server sent chunked encoding - transferring')
                         self.transferChunked(data, headers)
                     else:
                         # No body in the response, send as-is
                         self.socksSocket.send(data)
             except (ValueError, KeyError):
                 # Error parsing content-length or other header issues
-                LOG.debug('HTTP: Error parsing response headers, sending as-is')
                 self.socksSocket.send(data)
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.debug('HTTP: Socket error in transferResponse: %s' % str(e))
@@ -406,17 +458,30 @@ class HTTPSocksRelay(SocksRelay):
     def prepareRequest(self, data):
         # Parse the HTTP data, removing headers that break stuff
         response = []
+
+        # === DEBUG: Log request line ===
+        try:
+            req_line = data.split(EOL)[0].decode('utf-8', errors='replace')
+            _dbg('>>> REQUEST: %s' % req_line)
+        except: pass
+        # === END DEBUG ===
+
         for part in data.split(EOL):
             # This means end of headers, stop parsing here
             if part == b'':
                 break
             # Remove the Basic authentication header
             if b'authorization' in part.lower():
+                _dbg('>>> Stripped: %s' % part.decode('utf-8', errors='replace'))  # DEBUG
                 continue
             # Don't close the connection
             if b'connection: close' in part.lower():
                 response.append(b'Connection: Keep-Alive')
                 continue
+            # === DEBUG: Log cookie ===
+            if b'cookie' in part.lower():
+                _dbg('>>> Cookie: %s' % part.decode('utf-8', errors='replace'))
+            # === END DEBUG ===
             # If we are here it means we want to keep the header
             response.append(part)
         # Append the body
@@ -454,6 +519,14 @@ class HTTPSocksRelay(SocksRelay):
 
 
     def tunnelConnection(self):
+        # Get the socket lock for this session
+        try:
+            socketLock = self.activeRelays[self.username]['socketLock']
+        except KeyError:
+            LOG.error('HTTP: Socket lock not found for %s in tunnel' % self.username)
+            return
+
+        buffer = b''
         while True:
             try:
                 data = self.socksSocket.recv(self.packetSize)
@@ -461,10 +534,17 @@ class HTTPSocksRelay(SocksRelay):
                 if not data:
                     LOG.debug('HTTP: Client closed connection')
                     return
-                    
+                
+                buffer += data
+
+                # Check if we have a complete header block
+                if b'\r\n\r\n' not in buffer:
+                    # Keep reading
+                    continue
+
                 # Check for WebSocket upgrade requests in tunnel mode
                 try:
-                    headers = self.getHeaders(data)
+                    headers = self.getHeaders(buffer)
                     if headers.get('upgrade', '').lower() == 'websocket':
                         LOG.debug('HTTP: WebSocket upgrade in tunnel - rejecting')
                         response = b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nWebSocket not supported'
@@ -476,12 +556,19 @@ class HTTPSocksRelay(SocksRelay):
                 except:
                     # Continue with normal processing if header parsing fails
                     pass
-                    
-                # Pass the request to the server
-                tosend = self.prepareRequest(data)
-                self.relaySocket.send(tosend)
-                # Send the response back to the client
-                self.transferResponse()
+
+                # Use lock to prevent concurrent socket access from multiple threads
+                with socketLock:
+                    # Pass the request to the server
+                    # prepareRequest handles reading the rest of the body if needed
+                    tosend = self.prepareRequest(buffer)
+                    self.relaySocket.send(tosend)
+                    # Send the response back to the client
+                    self.transferResponse()
+                
+                # Reset buffer after processing a full request-response cycle
+                buffer = b''
+                
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 LOG.debug('HTTP: Connection error in tunnel: %s' % str(e))
                 return

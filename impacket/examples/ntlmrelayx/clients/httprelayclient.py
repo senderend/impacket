@@ -126,42 +126,32 @@ class HTTPRelayClient(ProtocolClient):
             self.session = None
 
     def keepAlive(self):
-        # Do a HEAD for favicon.ico with proper connection state management
+        # Use raw socket operations to keep connection alive
+        # IMPORTANT: We avoid session.request() because HTTPConnection can auto-recreate
+        # sockets, which would destroy the NTLM-authenticated session. Raw socket ops
+        # will simply fail if the socket is dead - they won't auto-recreate anything.
+        import threading
+        thread_id = threading.current_thread().ident
+
         try:
-            # Check if connection is in a proper state for sending requests
-            if hasattr(self.session, '_HTTPConnection__state'):
-                state = self.session._HTTPConnection__state
-                # Only send request if connection is idle
-                if state != 'Request-sent':
-                    self.session.request('HEAD','/favicon.ico')
-                    try:
-                        response = self.session.getresponse()
-                        response.read()  # Consume the response to reset connection state
-                    except Exception as e:
-                        LOG.debug('HTTP keepAlive: Error reading response: %s' % str(e))
-                        # Reset connection on error
-                        try:
-                            self.session.close()
-                            if isinstance(self, HTTPSRelayClient):
-                                try:
-                                    uv_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                                    self.session = HTTPSConnection(self.targetHost, self.targetPort, context=uv_context)
-                                except AttributeError:
-                                    self.session = HTTPSConnection(self.targetHost, self.targetPort)
-                            else:
-                                self.session = HTTPConnection(self.targetHost, self.targetPort)
-                        except Exception as reset_error:
-                            LOG.debug('HTTP keepAlive: Error resetting connection: %s' % str(reset_error))
-                else:
-                    LOG.debug('HTTP keepAlive: Skipping - connection in Request-sent state')
-            else:
-                # Fallback for connections without state attribute
-                self.session.request('HEAD','/favicon.ico')
-                response = self.session.getresponse()
-                response.read()
+            # Check if socket exists
+            if self.session.sock is None:
+                return
+
+            # Build raw HTTP HEAD request
+            head_request = b'HEAD /favicon.ico HTTP/1.1\r\nHost: ' + self.targetHost.encode() + b'\r\nConnection: Keep-Alive\r\n\r\n'
+
+            self.session.sock.send(head_request)
+
+            # Read response (just consume it to keep connection alive)
+            response_data = self.session.sock.recv(8192)
+            if not response_data:
+                LOG.debug('HTTP keepAlive: Thread %s - no data received (connection may be dead)' % thread_id)
+
         except Exception as e:
-            LOG.debug('HTTP keepAlive: Exception occurred: %s' % str(e))
+            LOG.debug('HTTP keepAlive: Thread %s - Exception occurred: %s' % (thread_id, str(e)))
             # Don't raise the exception - keepAlive failures shouldn't be fatal
+            # Don't close/recreate session - NTLM auth is bound to the TCP connection
 
 class HTTPSRelayClient(HTTPRelayClient):
     PLUGIN_NAME = "HTTPS"

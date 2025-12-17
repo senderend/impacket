@@ -47,14 +47,62 @@ class HTTPSSocksRelay(SSLServerMixin, HTTPSocksRelay):
         return True
 
     def tunnelConnection(self):
+        # Get the socket lock for this session
+        try:
+            socketLock = self.activeRelays[self.username]['socketLock']
+        except KeyError:
+            LOG.error('HTTPS: Socket lock not found for %s in tunnel' % self.username)
+            return
+
+        buffer = b''
         while True:
             try:
                 data = self.socksSocket.recv(self.packetSize)
+                if not data:
+                    LOG.debug('HTTPS: Client closed connection')
+                    return
+                
+                buffer += data
+
+                # Check if we have a complete header block
+                if b'\r\n\r\n' not in buffer:
+                    # Keep reading
+                    continue
+
+                # Check for WebSocket upgrade requests in tunnel mode
+                try:
+                    headers = self.getHeaders(buffer)
+                    if headers.get('upgrade', '').lower() == 'websocket':
+                        LOG.debug('HTTPS: WebSocket upgrade in tunnel - rejecting')
+                        response = b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nWebSocket not supported'
+                        try:
+                            self.socksSocket.send(response)
+                        except:
+                            pass
+                        return
+                except:
+                    # Continue with normal processing if header parsing fails
+                    pass
+
+                # Use lock to prevent concurrent socket access from multiple threads
+                with socketLock:
+                    # Pass the request to the server
+                    # prepareRequest handles reading the rest of the body if needed
+                    tosend = self.prepareRequest(buffer)
+                    self.relaySocket.send(tosend)
+                    # Send the response back to the client
+                    self.transferResponse()
+                
+                # Reset buffer after processing a full request-response cycle
+                buffer = b''
+
             except SSL.ZeroReturnError:
                 # The SSL connection was closed, return
+                LOG.debug('HTTPS: SSL connection closed by client')
                 return
-            # Pass the request to the server
-            tosend = self.prepareRequest(data)
-            self.relaySocket.send(tosend)
-            # Send the response back to the client
-            self.transferResponse()
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                LOG.debug('HTTPS: Connection error in tunnel: %s' % str(e))
+                return
+            except Exception as e:
+                LOG.debug('HTTPS: Unexpected error in tunnel: %s' % str(e))
+                return
