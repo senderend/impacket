@@ -82,10 +82,11 @@ class HTTPSocksRelay(SocksRelay):
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.debug('HTTP: Client connection error: %s' % str(e))
             return False
-        
+
         # Check if this is a session selection request
         try:
             request_line = data.split(EOL)[0].decode("ascii")
+            LOG.info('HTTP: [DIAGNOSTIC] skipAuthentication called for: %s' % request_line)
         except (UnicodeDecodeError, IndexError):
             LOG.debug('HTTP: Invalid request format')
             return False
@@ -228,14 +229,53 @@ class HTTPSocksRelay(SocksRelay):
 
         # Send the initial request to the server
         try:
-            # Use lock to prevent concurrent socket access from multiple threads
-            # Only one thread can send/receive at a time to prevent socket state corruption
-            import threading
-            with socketLock:
+            # Kernel auth workaround: check if we should route through anonymous connection
+            use_anon = False
+            LOG.info('HTTP: [DIAGNOSTIC] Starting skipAuthentication probe logic check')
+            probe_check = self.shouldProbeAnonymous()
+            LOG.info('HTTP: [DIAGNOSTIC] shouldProbeAnonymous returned: %s' % probe_check)
+            if probe_check:
+                path = self.extractRequestPath(data)
+                LOG.info('HTTP: [DIAGNOSTIC] Extracted path: %s' % path)
+                if path:
+                    relayClient = self.activeRelays[self.username]['protocolClient']
+                    needs_auth, status = relayClient.probePathAnonymous(path)
+
+                    if not needs_auth:
+                        # This path doesn't require auth - use anonymous connection to avoid
+                        # resetting kernel auth context on the authenticated relay
+                        use_anon = True
+                        LOG.info('HTTP: Routing %s through anonymous connection (avoids kernel auth reset)' % path)
+                    else:
+                        LOG.debug('HTTP: Path %s requires auth, using authenticated relay' % path)
+
+            if use_anon:
+                # Send through anonymous connection to avoid resetting kernel auth context
+                relayClient = self.activeRelays[self.username]['protocolClient']
+                anonConn = relayClient.getAnonConnection()
+
+                # Ensure socket exists - connect() creates it if needed
+                if not anonConn.sock:
+                    try:
+                        anonConn.connect()
+                    except Exception as e:
+                        LOG.error('HTTP: Failed to establish anonymous connection: %s' % str(e))
+                        return False
+
+                # Send through anonymous socket using same flow as authenticated relay
                 tosend = self.prepareRequest(data)
-                self.relaySocket.send(tosend)
-                # Send the response back to the client
-                self.transferResponse()
+                self.relaySocket = anonConn.sock  # Point to anon socket for transferResponse()
+                anonConn.sock.send(tosend)
+                self.transferResponse()  # Reuse existing response transfer logic
+            else:
+                # Use lock to prevent concurrent socket access from multiple threads
+                # Only one thread can send/receive at a time to prevent socket state corruption
+                import threading
+                with socketLock:
+                    tosend = self.prepareRequest(data)
+                    self.relaySocket.send(tosend)
+                    # Send the response back to the client
+                    self.transferResponse()
             return True
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             LOG.error('HTTP: Failed to send initial request for session %s: %s' % (self.username, str(e)))
@@ -455,6 +495,140 @@ class HTTPSocksRelay(SocksRelay):
         except Exception as e:
             LOG.debug('HTTP: Unexpected error in transferChunked: %s' % str(e))
 
+    def extractRequestPath(self, data):
+        """Extract the path from HTTP request data"""
+        try:
+            request_line = data.split(EOL)[0].decode('utf-8', errors='replace')
+            parts = request_line.split(' ')
+            if len(parts) >= 2:
+                return parts[1]  # The path is the second element
+        except:
+            pass
+        return None
+
+    def shouldProbeAnonymous(self):
+        """Check if kernel auth mode is enabled and we have access to probe"""
+        LOG.info('HTTP: [DIAGNOSTIC] shouldProbeAnonymous: username=%s' % self.username)
+        if not self.username:
+            LOG.info('HTTP: [DIAGNOSTIC] shouldProbeAnonymous: No username, returning False')
+            return False
+        if self.username not in self.activeRelays:
+            LOG.info('HTTP: [DIAGNOSTIC] shouldProbeAnonymous: Username not in activeRelays, returning False')
+            return False
+        relayClient = self.activeRelays[self.username]['protocolClient']
+        kernel_auth_enabled = relayClient.serverConfig.kernelAuth
+        LOG.info('HTTP: [DIAGNOSTIC] shouldProbeAnonymous: kernelAuth=%s' % kernel_auth_enabled)
+        return kernel_auth_enabled
+
+    def _processRequestWithProbe(self, buffer, socketLock, protocol='HTTP'):
+        """
+        Process request with try-anonymous-first, fallback-to-auth strategy.
+        Tries sending request through anonymous connection first. If we get 401,
+        fallback to authenticated relay for NTLM.
+
+        Args:
+            buffer: Request data (includes cookies from browser)
+            socketLock: Threading lock for socket access
+            protocol: Protocol name for logging ('HTTP' or 'HTTPS')
+        """
+        if not self.shouldProbeAnonymous():
+            # Kernel auth mode not enabled, use authenticated relay normally
+            with socketLock:
+                tosend = self.prepareRequest(buffer)
+                self.relaySocket.send(tosend)
+                self.transferResponse()
+            return
+
+        # Try anonymous connection first (with cookies from browser request)
+        # Create fresh connection for each request to avoid race conditions
+        relayClient = self.activeRelays[self.username]['protocolClient']
+
+        # Create a fresh anonymous connection (don't use cached one)
+        try:
+            import ssl
+            try:
+                from http.client import HTTPSConnection
+            except ImportError:
+                from httplib import HTTPSConnection
+
+            try:
+                uv_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                anonConn = HTTPSConnection(relayClient.targetHost, relayClient.targetPort, context=uv_context)
+            except AttributeError:
+                anonConn = HTTPSConnection(relayClient.targetHost, relayClient.targetPort)
+
+            # Establish connection
+            anonConn.connect()
+        except Exception as e:
+            LOG.error('%s: Failed to establish anonymous connection: %s' % (protocol, str(e)))
+            # Fallback to authenticated relay
+            with socketLock:
+                tosend = self.prepareRequest(buffer)
+                self.relaySocket.send(tosend)
+                self.transferResponse()
+            return
+
+        # Send browser request (with cookies) through anonymous connection
+        tosend = self.prepareRequest(buffer)
+        path = self.extractRequestPath(buffer)
+
+        try:
+            anonConn.sock.send(tosend)
+
+            # Read response status to check if NTLM auth required
+            response_data = anonConn.sock.recv(self.packetSize)
+
+            if not response_data:
+                LOG.debug('%s: No response from anonymous connection' % protocol)
+                # Fallback to authenticated relay
+                anonConn.close()
+                with socketLock:
+                    self.relaySocket.send(tosend)
+                    self.transferResponse()
+                return
+
+            # Check response status
+            status_line = response_data.split(b'\r\n')[0].decode('utf-8', errors='replace')
+
+            if '401' in status_line and b'WWW-Authenticate' in response_data:
+                # Got 401 with auth challenge - path requires NTLM
+                LOG.info('%s: Path %s requires NTLM auth, retrying through authenticated relay' % (protocol, path))
+
+                # Close anonymous connection
+                anonConn.close()
+
+                with socketLock:
+                    self.relaySocket.send(tosend)
+                    self.transferResponse()
+            else:
+                # Success! Path works with just cookies
+                LOG.info('%s: Path %s succeeded through anonymous connection (cookie-based auth)' % (protocol, path))
+
+                # Forward the response we already received to client
+                self.socksSocket.send(response_data)
+
+                # Continue forwarding rest of response if needed
+                # (Response might be larger than initial buffer)
+                self.relaySocket = anonConn.sock
+                while True:
+                    more_data = anonConn.sock.recv(self.packetSize)
+                    if not more_data:
+                        break
+                    self.socksSocket.send(more_data)
+
+                # Close after successful use
+                anonConn.close()
+
+        except Exception as e:
+            LOG.debug('%s: Anonymous connection error: %s, falling back to authenticated relay' % (protocol, str(e)))
+            try:
+                anonConn.close()
+            except:
+                pass
+            with socketLock:
+                self.relaySocket.send(tosend)
+                self.transferResponse()
+
     def prepareRequest(self, data):
         # Parse the HTTP data, removing headers that break stuff
         response = []
@@ -528,6 +702,7 @@ class HTTPSocksRelay(SocksRelay):
 
         buffer = b''
         while True:
+            LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] While loop iteration started')
             try:
                 data = self.socksSocket.recv(self.packetSize)
                 # If this returns with an empty string, it means the socket was closed
@@ -541,6 +716,8 @@ class HTTPSocksRelay(SocksRelay):
                 if b'\r\n\r\n' not in buffer:
                     # Keep reading
                     continue
+
+                LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] Complete header block detected, buffer length: %d' % len(buffer))
 
                 # Check for WebSocket upgrade requests in tunnel mode
                 try:
@@ -557,15 +734,52 @@ class HTTPSocksRelay(SocksRelay):
                     # Continue with normal processing if header parsing fails
                     pass
 
-                # Use lock to prevent concurrent socket access from multiple threads
-                with socketLock:
-                    # Pass the request to the server
-                    # prepareRequest handles reading the rest of the body if needed
+                LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] Reached probe logic section')
+                # Kernel auth workaround: check if we should route through anonymous connection
+                use_anon = False
+                LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] Checking probe logic in tunnelConnection')
+                if self.shouldProbeAnonymous():
+                    LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] shouldProbeAnonymous returned True')
+                    path = self.extractRequestPath(buffer)
+                    LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] Extracted path: %s' % path)
+                    if path:
+                        relayClient = self.activeRelays[self.username]['protocolClient']
+                        needs_auth, status = relayClient.probePathAnonymous(path)
+
+                        if not needs_auth:
+                            use_anon = True
+                            LOG.info('HTTP: Tunnel routing %s through anonymous connection' % path)
+                        else:
+                            LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] Path %s requires auth' % path)
+                else:
+                    LOG.info('HTTP: [DIAGNOSTIC-TUNNEL] shouldProbeAnonymous returned False')
+
+                if use_anon:
+                    # Route through anonymous connection
+                    relayClient = self.activeRelays[self.username]['protocolClient']
+                    anonConn = relayClient.getAnonConnection()
+
+                    if not anonConn.sock:
+                        try:
+                            anonConn.connect()
+                        except Exception as e:
+                            LOG.error('HTTP: Failed to establish anonymous connection: %s' % str(e))
+                            return
+
                     tosend = self.prepareRequest(buffer)
-                    self.relaySocket.send(tosend)
-                    # Send the response back to the client
+                    self.relaySocket = anonConn.sock
+                    anonConn.sock.send(tosend)
                     self.transferResponse()
-                
+                else:
+                    # Use lock to prevent concurrent socket access from multiple threads
+                    with socketLock:
+                        # Pass the request to the server
+                        # prepareRequest handles reading the rest of the body if needed
+                        tosend = self.prepareRequest(buffer)
+                        self.relaySocket.send(tosend)
+                        # Send the response back to the client
+                        self.transferResponse()
+
                 # Reset buffer after processing a full request-response cycle
                 buffer = b''
                 

@@ -90,6 +90,7 @@ class NTLMRelayxConfig:
 
         # HTTP options
         self.remove_target = False
+        self.kernelAuth = False
 
         # WebDAV options
         self.serve_image = False
@@ -245,6 +246,9 @@ class NTLMRelayxConfig:
 
     def setWebDAVOptions(self, serve_image):
         self.serve_image = serve_image
+
+    def setKernelAuth(self, kernelAuth):
+        self.kernelAuth = kernelAuth
 
     def setADCSOptions(self, template):
         self.template = template

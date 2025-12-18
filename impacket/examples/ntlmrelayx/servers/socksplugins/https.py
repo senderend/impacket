@@ -84,14 +84,8 @@ class HTTPSSocksRelay(SSLServerMixin, HTTPSocksRelay):
                     # Continue with normal processing if header parsing fails
                     pass
 
-                # Use lock to prevent concurrent socket access from multiple threads
-                with socketLock:
-                    # Pass the request to the server
-                    # prepareRequest handles reading the rest of the body if needed
-                    tosend = self.prepareRequest(buffer)
-                    self.relaySocket.send(tosend)
-                    # Send the response back to the client
-                    self.transferResponse()
+                # Process request with kernel auth probe logic (inherited from parent)
+                self._processRequestWithProbe(buffer, socketLock, protocol='HTTPS')
                 
                 # Reset buffer after processing a full request-response cycle
                 buffer = b''

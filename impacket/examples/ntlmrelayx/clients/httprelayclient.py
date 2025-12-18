@@ -23,6 +23,7 @@ try:
 except ImportError:
     from httplib import HTTPConnection, HTTPSConnection, ResponseNotReady
 import base64
+from threading import Lock
 
 from struct import unpack
 from impacket import LOG
@@ -36,6 +37,10 @@ PROTOCOL_CLIENT_CLASSES = ["HTTPRelayClient","HTTPSRelayClient"]
 class HTTPRelayClient(ProtocolClient):
     PLUGIN_NAME = "HTTP"
 
+    # Class-level cache: maps (host, port, path) -> requires_auth (True/False)
+    # Shared across all instances to remember which paths need authentication
+    authCache = {}
+
     def __init__(self, serverConfig, target, targetPort = 80, extendedSecurity=True ):
         ProtocolClient.__init__(self, serverConfig, target, targetPort, extendedSecurity)
         self.extendedSecurity = extendedSecurity
@@ -43,6 +48,8 @@ class HTTPRelayClient(ProtocolClient):
         self.authenticateMessageBlob = None
         self.server = None
         self.authenticationMethod = None
+        self.anonSession = None  # Anonymous connection for kernel auth workaround
+        self.anonLock = Lock()  # Lock for thread-safe anonymous connection access
 
     def initConnection(self):
         self.session = HTTPConnection(self.targetHost,self.targetPort)
@@ -153,6 +160,55 @@ class HTTPRelayClient(ProtocolClient):
             # Don't raise the exception - keepAlive failures shouldn't be fatal
             # Don't close/recreate session - NTLM auth is bound to the TCP connection
 
+    def getAnonConnection(self):
+        """Get or create anonymous connection for kernel auth workaround"""
+        if self.anonSession is None:
+            LOG.debug('HTTP: Creating anonymous connection to %s:%s' % (self.targetHost, self.targetPort))
+            self.anonSession = HTTPConnection(self.targetHost, self.targetPort)
+        return self.anonSession
+
+    def probePathAnonymous(self, path):
+        """
+        Probe a path anonymously to check if authentication is required.
+        Returns: (needs_auth: bool, status_code: int or None)
+        """
+        # Strip query parameters for caching - /page?a=1 and /page?a=2 should share cache
+        path_without_query = path.split('?')[0] if '?' in path else path
+        cache_key = (self.targetHost, self.targetPort, path_without_query)
+
+        # Check cache first
+        if cache_key in HTTPRelayClient.authCache:
+            cached_result = HTTPRelayClient.authCache[cache_key]
+            LOG.debug('HTTP: Cache hit for %s - requires_auth=%s' % (path, cached_result))
+            return cached_result, None
+
+        # Use lock to prevent concurrent probe attempts on same connection
+        with self.anonLock:
+            try:
+                anon = self.getAnonConnection()
+                anon.request('GET', path)
+                response = anon.getresponse()
+                status = response.status  # Read status before consuming body
+                response.read()  # Consume response body
+
+                needs_auth = (status == 401)
+
+                # Close connection to ensure clean state for next probe
+                anon.close()
+                self.anonSession = None  # Reset so next probe gets fresh connection
+
+                # Cache the result (by path without query params)
+                HTTPRelayClient.authCache[cache_key] = needs_auth
+                LOG.info('HTTP: Probed %s anonymously - status %d, requires_auth=%s (cached as %s)' % (path, status, needs_auth, path_without_query))
+
+                return needs_auth, status
+
+            except Exception as e:
+                LOG.debug('HTTP: Anonymous probe failed for %s: %s' % (path, str(e)))
+                # On error, assume auth is needed to be safe
+                HTTPRelayClient.authCache[cache_key] = True
+                return True, None
+
 class HTTPSRelayClient(HTTPRelayClient):
     PLUGIN_NAME = "HTTPS"
 
@@ -172,3 +228,14 @@ class HTTPSRelayClient(HTTPRelayClient):
         except AttributeError:
             self.session = HTTPSConnection(self.targetHost,self.targetPort)
         return True
+
+    def getAnonConnection(self):
+        """Get or create anonymous HTTPS connection for kernel auth workaround"""
+        if self.anonSession is None:
+            LOG.debug('HTTPS: Creating anonymous connection to %s:%s' % (self.targetHost, self.targetPort))
+            try:
+                uv_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                self.anonSession = HTTPSConnection(self.targetHost, self.targetPort, context=uv_context)
+            except AttributeError:
+                self.anonSession = HTTPSConnection(self.targetHost, self.targetPort)
+        return self.anonSession

@@ -201,6 +201,7 @@ def start_servers(options, threads):
         c.setIMAPOptions(options.keyword, options.mailbox, options.all, options.imap_max)
         c.setIPv6(options.ipv6)
         c.setWpadOptions(options.wpad_host, options.wpad_auth_num)
+        c.setKernelAuth(options.kernel_auth)
         c.setSMB2Support(options.smb2support)
         c.setSMBChallenge(options.ntlmchallenge)
         c.setSMBRPCAttack(options.rpc_attack)
@@ -309,6 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--no-multirelay', action="store_true", required=False, help='If set, disable multi-host relay (SMB and HTTP servers)')
     parser.add_argument('--keep-relaying', action="store_true", required=False, help='If set, keeps relaying to a target even after a successful connection on it')
     parser.add_argument('-ra','--random', action='store_true', help='Randomize target selection')
+    parser.add_argument('--kernel-auth', action='store_true', required=False, help='Enable IIS kernel mode auth workaround: probe targets anonymously first to avoid resetting auth context')
     parser.add_argument('-r', action='store', metavar = 'SMBSERVER', help='Redirect HTTP requests to a file:// path on SMBSERVER')
     parser.add_argument('-l','--lootdir', action='store', type=str, required=False, metavar = 'LOOTDIR',default='.', help='Loot '
                     'directory in which gathered loot such as SAM dumps will be stored (default: current directory).')
